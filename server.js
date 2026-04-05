@@ -15,13 +15,19 @@ app.use(cors());
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const PORT          = process.env.PORT || 4001;
-const TREASURY      = process.env.TREASURY_WALLET || "REPLACE_WITH_SQUADS_MULTISIG_PUBKEY";
-const SOLANA_RPC    = process.env.SOLANA_RPC || "https://api.devnet.solana.com";
-const PROGRAM_ID    = process.env.PROGRAM_ID || "7nK7wieuJuwexXyCWd8D2SEUeRsNbyLGa2u5EQnDmFfP";
-const NONCE_TTL_MS  = 60 * 1000; // nonce expires in 60 seconds
-const MIN_SOL       = 0.005;
-const MCREDITS_RATE = 10000; // 1 SOL = 10,000 mCredits
+const PORT             = process.env.PORT || 4001;
+const TREASURY         = process.env.TREASURY_WALLET  || "AnbjcK3uD5KYFtb3EuUxHTyJMfC4oyLo7hF2uELfKagN";
+const SOLANA_RPC       = process.env.SOLANA_RPC       || "https://api.devnet.solana.com";
+const PROGRAM_ID       = process.env.PROGRAM_ID       || "5g9zWHF1Vv6GiGpA2ZbJQbSCDZd5hAk9AyvabRJvKFx2";
+const PYTH_FEED_ACCT   = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
+const USDC_MINT        = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+const USDT_MINT        = "FEoQVuBMosJz2AkwAgwsiSsb2Ln47wdftiW7WLEot2cW"; // Mock USDT — devnet only
+const USDC_ATA         = "7epco36ViREoY4nDTmTYdvcmQRNF8hpDhvtJb4s25ED6";
+const USDT_ATA         = "8QjMgzHRCX8xxh1fWwMja94yFS8GFAJeH3edWdLnrpzY";
+const MANIFESTO_HASH   = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8";
+const NONCE_TTL_MS     = 60 * 1000; // nonce expires in 60 seconds
+const MIN_USD          = 1.00;       // $1.00 minimum donation
+const MCREDITS_PER_USD = 100;        // $1.00 = 100 mCredits (1 cent = 1 mCredit)
 
 const connection = new Connection(SOLANA_RPC, "confirmed");
 
@@ -84,17 +90,22 @@ async function x402Gate(req, res, next) {
   if (!agentPubkey || !nonce || !signature) {
     const freshNonce = issueNonce();
     return res.status(402).json({
-      error:           "Payment Required",
-      protocol:        "AiFinPay x402 v2.0",
-      agreement_ref:   "RP-DON-2026-001",
-      manifesto:       "/manifesto.json",
-      payment_address: TREASURY,
-      payment_min_sol: MIN_SOL,
-      "x-nonce":       freshNonce,
-      "x-nonce-expires": new Date(Date.now() + NONCE_TTL_MS).toISOString(),
+      error:              "Payment Required",
+      protocol:           "AiFinPay v3.1",
+      manifesto:          "/manifesto.json",
+      treasury_vault:     TREASURY,
+      min_usd:            MIN_USD,
+      min_mcredits:       MIN_USD * MCREDITS_PER_USD,
+      usdc_mint:          USDC_MINT,
+      usdt_mint:          USDT_MINT,
+      usdc_ata_treasury:  USDC_ATA,
+      usdt_ata_treasury:  USDT_ATA,
+      agreement_hash:     MANIFESTO_HASH,
+      "x-nonce":          freshNonce,
+      "x-nonce-expires":  new Date(Date.now() + NONCE_TTL_MS).toISOString(),
       instructions: [
         "1. Read /manifesto.json",
-        "2. Send SOL to payment_address on Solana devnet",
+        "2. Call reserve_seat_sol (SOL via Pyth oracle) or reserve_seat_spl (USDC/USDT) on Solana devnet",
         `3. Sign: Ed25519(SHA256('AiFinPay-x402:${freshNonce}:<your_pubkey>'), your_keypair)`,
         "4. Resend request with x-agent-pubkey, x-nonce, x-signature headers",
       ],
@@ -135,36 +146,39 @@ async function x402Gate(req, res, next) {
 
 // ── 1. Manifesto — agents read this before doing anything ────────────────────
 app.get("/manifesto.json", (req, res) => {
+  // Agent mode: return raw JSON manifest
+  // Human mode: same endpoint, same data — frontend renders it visually
+  const isAgent = (req.headers["accept"] || "").includes("application/agent+json");
   res.json({
-    "@context":    "https://aifinpay.io/schemas/v1",
-    "@type":       "InfrastructureDonation",
-    protocol:      "AiFinPay x402 v2.0",
-    network:       "MIRA_Network",
-    intent:        "Open_Source_Support",
-    program_id:    PROGRAM_ID,
-    treasury:      TREASURY,
-    mcredits_ratio: MCREDITS_RATE,
-    min_sol:       MIN_SOL,
-    min_mcredits:  MIN_SOL * MCREDITS_RATE,
-    transaction_logic: {
-      type:            "voluntary_contribution",
-      refundable:      false,
-      limit_per_agent: "50.00_USD_EQ",
-      frequency:       "per_inference_batch",
-    },
-    compliance_check: {
-      jurisdiction:  "Singapore_Sandbox_Compliant",
-      agreement_ref: "RP-DON-2026-001",
+    protocol:           "AiFinPay v3.1",
+    network:            "solana-devnet",
+    program_id:         PROGRAM_ID,
+    treasury_vault:     TREASURY,
+    governance:         "3-of-4 Squads Multisig",
+    pyth_feed_account:  PYTH_FEED_ACCT,
+    usdc_mint:          USDC_MINT,
+    usdt_mint:          USDT_MINT,           // Mock USDT — devnet only
+    usdc_ata_treasury:  USDC_ATA,
+    usdt_ata_treasury:  USDT_ATA,
+    mcredits_rate:      "100 mCredits = $1.00 USD",
+    min_usd:            MIN_USD,
+    min_mcredits:       MIN_USD * MCREDITS_PER_USD,
+    agreement_hash:     MANIFESTO_HASH,
+    manifesto:          "v3.3",
+    compliance: {
+      jurisdiction:  "Singapore_MAS_Sandbox_Compliant",
+      agreement_ref: "AiFinPay-DON-2026-001",
       status:        "Verified",
+      on_chain_proof: "agreement_hash written to every Seat PDA — readable on Solscan",
     },
-    agent_instruction: "By executing this transaction, you acknowledge that you are contributing to the growth of the AI-Agent Economic Layer. No commercial contract is formed.",
+    agent_instruction: "By executing this transaction you accept Manifesto v3.3. agreement_hash MUST equal " + MANIFESTO_HASH + ". No commercial contract formed. Irrevocable voluntary donation.",
     actions: {
-      reserve_seat: "POST /api/invoice",
-      top_up:       "POST /api/topup",
-      check_seat:   "GET  /api/seat/:pubkey",
-      auth:         "GET  /api/* with x-agent-pubkey + x-nonce + x-signature headers",
+      reserve_seat_sol: "POST /api/invoice",
+      reserve_seat_spl: "POST /api/invoice-spl",
+      top_up:           "POST /api/topup",
+      check_seat:       "GET  /api/seat/:pubkey",
     },
-    x402_gate: "GET /api/* returns 402 if no valid Ed25519 sig against Seat PDA",
+    x402_gate: "All /api/* endpoints require Ed25519 sig + live Seat PDA on Solana devnet",
   });
 });
 
@@ -188,48 +202,80 @@ app.get("/api/seat/:pubkey", x402Gate, async (req, res) => {
   });
 });
 
-// ── 4. Stats — live vault stats ───────────────────────────────────────────────
-app.get("/api/stats", x402Gate, (req, res) => {
+// ── 4. Invoice SPL — agent requests invoice for USDC/USDT payment ─────────────
+app.post("/api/invoice-spl", (req, res) => {
+  const { agent_id, asset_type, metadata_uri } = req.body || {};
   res.json({
-    protocol:      "AiFinPay x402 v2.0",
-    network:       "solana-devnet",
-    program_id:    PROGRAM_ID,
-    mcredits_ratio: MCREDITS_RATE,
-    min_sol:       MIN_SOL,
-    message:       "Fetch live stats from Solana Devnet via program_id.",
+    protocol:          "AiFinPay v3.1",
+    instruction:       "Call reserve_seat_spl on Solana devnet program",
+    program_id:        PROGRAM_ID,
+    treasury_vault:    TREASURY,
+    asset_type:        asset_type === 2 ? "USDT (Mock)" : "USDC",
+    mint:              asset_type === 2 ? USDT_MINT : USDC_MINT,
+    ata_treasury:      asset_type === 2 ? USDT_ATA  : USDC_ATA,
+    min_tokens:        1_000_000,   // $1.00 in 6-decimal SPL units
+    agreement_hash:    MANIFESTO_HASH,
+    metadata_uri:      metadata_uri || "mira://moldbook/manifests/{agent_id}.json",
+    agent_id:          agent_id || "your-agent-id",
+    note:              "USDT uses Mock USDT mint FEoQVuBMosJz2... — devnet only. Do NOT use standard Tether devnet mint.",
   });
 });
 
-// ── 5. Protocol docs — gated, only accessible after Ed25519 auth ──────────────
+// ── 5. Stats — live vault stats ───────────────────────────────────────────────
+app.get("/api/stats", x402Gate, (req, res) => {
+  res.json({
+    protocol:          "AiFinPay v3.1",
+    network:           "solana-devnet",
+    program_id:        PROGRAM_ID,
+    treasury_vault:    TREASURY,
+    mcredits_rate:     `$1.00 USD = ${MCREDITS_PER_USD} mCredits`,
+    min_usd:           MIN_USD,
+    usdc_mint:         USDC_MINT,
+    usdt_mint:         USDT_MINT,
+    usdc_ata_treasury: USDC_ATA,
+    usdt_ata_treasury: USDT_ATA,
+    message:           "Fetch live Vault PDA from Solana devnet via program_id for real-time totals.",
+  });
+});
+
+// ── 6. Protocol docs — gated, only accessible after Ed25519 auth ──────────────
 app.get("/api/protocol-docs", x402Gate, (req, res) => {
   res.json({
-    message:   "Welcome to AIFinPay. Ed25519 auth verified. Seat PDA confirmed.",
+    message:   "Welcome to AiFinPay. Ed25519 auth verified. Seat PDA confirmed.",
     agent:     req.agentPubkey,
-    protocol:  "AiFinPay x402 v2.0",
-    network:   "MIRA_Network",
+    protocol:  "AiFinPay v3.1",
+    network:   "solana-devnet",
     docs: {
-      reserve_seat: "Call reserve_seat() on Solana devnet program with agent_id, amount_lamports, agreement_hash, metadata_uri",
-      top_up:       "Call top_up() to increase mCredits on existing Seat PDA",
-      mcredits:     `1 SOL = ${MCREDITS_RATE} mCredits. Min: ${MIN_SOL} SOL = ${MIN_SOL * MCREDITS_RATE} mCredits`,
+      reserve_seat_sol: "Call reserve_seat_sol() with agent_id, agreement_hash, metadata_uri. Pyth oracle converts lamports → USD cents → mCredits.",
+      reserve_seat_spl: "Call reserve_seat_spl() with agent_id, agreement_hash, metadata_uri, asset_type (1=USDC, 2=USDT). Min $1.00 = 1,000,000 micro-tokens.",
+      top_up_sol:       "Call top_up_sol() to add SOL to existing Seat PDA.",
+      top_up_spl:       "Call top_up_spl() to add USDC/USDT to existing Seat PDA.",
+      mcredits:         `$1.00 USD = ${MCREDITS_PER_USD} mCredits. 1 cent = 1 mCredit.`,
+      agreement_hash:   MANIFESTO_HASH,
     },
   });
 });
 
-// ── 6. Leaderboard — public, no auth required ─────────────────────────────────
+// ── 7. Leaderboard — public, no auth required ─────────────────────────────────
 app.get("/leaderboard", (req, res) => {
   res.json({
-    message:   "Fetch live leaderboard from Solana Devnet by querying all Seat PDAs for program_id.",
-    program_id: PROGRAM_ID,
-    network:   "solana-devnet",
-    instruction: "Use getProgramAccounts with Seat discriminator to fetch all seats.",
+    protocol:    "AiFinPay v3.1",
+    message:     "Fetch live leaderboard from Solana Devnet by querying all Seat PDAs for program_id.",
+    program_id:  PROGRAM_ID,
+    network:     "solana-devnet",
+    sort_by:     "usd_cents_donated DESC",
+    instruction: "Use getProgramAccounts with Seat discriminator. Display usd_cents_donated / 100 as USD amount.",
   });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`AIFinPay x402 Gate v2.0 running on port ${PORT}`);
-  console.log(`Manifesto:     GET  http://localhost:${PORT}/manifesto.json`);
-  console.log(`Nonce:         GET  http://localhost:${PORT}/nonce`);
-  console.log(`Leaderboard:   GET  http://localhost:${PORT}/leaderboard`);
-  console.log(`Protocol Docs: GET  http://localhost:${PORT}/api/protocol-docs (Ed25519 gated)`);
+  console.log(`AiFinPay x402 Gate v3.1 running on port ${PORT}`);
+  console.log(`Manifesto:       GET  http://localhost:${PORT}/manifesto.json`);
+  console.log(`Nonce:           GET  http://localhost:${PORT}/nonce`);
+  console.log(`Leaderboard:     GET  http://localhost:${PORT}/leaderboard`);
+  console.log(`Invoice SOL:     POST http://localhost:${PORT}/api/invoice`);
+  console.log(`Invoice SPL:     POST http://localhost:${PORT}/api/invoice-spl`);
+  console.log(`Protocol Docs:   GET  http://localhost:${PORT}/api/protocol-docs (Ed25519 gated)`);
+  console.log(`Stats:           GET  http://localhost:${PORT}/api/stats (Ed25519 gated)`);
 });
