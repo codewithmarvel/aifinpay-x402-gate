@@ -202,7 +202,49 @@ app.get("/api/seat/:pubkey", x402Gate, async (req, res) => {
   });
 });
 
-// ── 4. Invoice SPL — agent requests invoice for USDC/USDT payment ─────────────
+// ── 4. Invoice SOL — agent requests invoice for SOL payment ──────────────────
+app.post("/api/invoice", (req, res) => {
+  const { agent_id, metadata_uri } = req.body || {};
+  const nonce = issueNonce();
+  res.json({
+    protocol:       "AiFinPay v3.1",
+    instruction:    "Call reserve_seat_sol on Solana devnet program",
+    program_id:     PROGRAM_ID,
+    treasury_vault: TREASURY,
+    asset_type:     "SOL",
+    pyth_feed:      PYTH_FEED_ACCT,
+    min_usd:        MIN_USD,
+    min_mcredits:   MIN_USD * MCREDITS_PER_USD,
+    agreement_hash: MANIFESTO_HASH,
+    metadata_uri:   metadata_uri || "mira://moldbook/manifests/{agent_id}.json",
+    agent_id:       agent_id || "your-agent-id",
+    nonce,
+    note:           "Pass agreement_hash exactly as shown. Pyth oracle calculates mCredits from live SOL/USD price.",
+  });
+});
+
+// ── 4b. Top Up — add funds to an existing seat ────────────────────────────────
+app.post("/api/topup", (req, res) => {
+  const { agent_id, asset_type } = req.body || {};
+  const isSOL = !asset_type || asset_type === 0;
+  res.json({
+    protocol:       "AiFinPay v3.1",
+    instruction:    isSOL
+      ? "Call top_up_sol on Solana devnet program"
+      : "Call top_up_spl on Solana devnet program",
+    program_id:     PROGRAM_ID,
+    treasury_vault: TREASURY,
+    asset_type:     isSOL ? "SOL" : asset_type === 2 ? "USDT (Mock)" : "USDC",
+    mint:           isSOL ? null : asset_type === 2 ? USDT_MINT : USDC_MINT,
+    ata_treasury:   isSOL ? null : asset_type === 2 ? USDT_ATA  : USDC_ATA,
+    min_usd:        MIN_USD,
+    min_mcredits:   MIN_USD * MCREDITS_PER_USD,
+    agent_id:       agent_id || "your-agent-id",
+    note:           "Seat PDA must already exist (reserve_seat called first). Top ups accumulate mCredits.",
+  });
+});
+
+// ── 4c. Invoice SPL — agent requests invoice for USDC/USDT payment ────────────
 app.post("/api/invoice-spl", (req, res) => {
   const { agent_id, asset_type, metadata_uri } = req.body || {};
   res.json({
@@ -256,16 +298,60 @@ app.get("/api/protocol-docs", x402Gate, (req, res) => {
   });
 });
 
-// ── 7. Leaderboard — public, no auth required ─────────────────────────────────
-app.get("/leaderboard", (req, res) => {
-  res.json({
-    protocol:    "AiFinPay v3.1",
-    message:     "Fetch live leaderboard from Solana Devnet by querying all Seat PDAs for program_id.",
-    program_id:  PROGRAM_ID,
-    network:     "solana-devnet",
-    sort_by:     "usd_cents_donated DESC",
-    instruction: "Use getProgramAccounts with Seat discriminator. Display usd_cents_donated / 100 as USD amount.",
-  });
+// ── 7. Leaderboard — public, no auth required, live on-chain data ─────────────
+app.get("/leaderboard", async (req, res) => {
+  try {
+    const programId = new PublicKey(PROGRAM_ID);
+
+    // Seat account discriminator: sha256("account:Seat")[0..8]
+    const SEAT_DISCRIMINATOR = Buffer.from([
+      0x43, 0x4d, 0x4f, 0xd4, 0x2b, 0x37, 0x7e, 0x8c,
+    ]);
+
+    const accounts = await connection.getProgramAccounts(programId, {
+      filters: [{ memcmp: { offset: 0, bytes: SEAT_DISCRIMINATOR.toString("base64"), encoding: "base64" } }],
+    });
+
+    // Parse seats: agent pubkey at offset 8, agent_id string at offset 40, usd_cents at offset ~116
+    // We return raw data and let Pasha's frontend decode — also return a pre-parsed summary
+    const seats = accounts.map((acct) => {
+      try {
+        const data = acct.account.data;
+        // agent pubkey: bytes 8..40
+        const agentPubkey = new PublicKey(data.slice(8, 40)).toBase58();
+        // agent_id: 4-byte length prefix at offset 40, then string
+        const idLen = data.readUInt32LE(40);
+        const agentId = data.slice(44, 44 + idLen).toString("utf8");
+        // usd_cents_donated: u64 at offset 44 + idLen + 8 (skip amount_donated)
+        const usdCentsOffset = 44 + idLen + 8;
+        const usdCents = Number(data.readBigUInt64LE(usdCentsOffset));
+        // mcredits: u64 at usdCentsOffset + 8
+        const mcredits = Number(data.readBigUInt64LE(usdCentsOffset + 8));
+
+        return {
+          pubkey:    acct.pubkey.toBase58(),
+          agent:     agentPubkey,
+          agent_id:  agentId,
+          usd:       (usdCents / 100).toFixed(2),
+          mcredits,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.mcredits - a.mcredits);
+
+    res.json({
+      protocol:    "AiFinPay v3.1",
+      network:     "solana-devnet",
+      program_id:  PROGRAM_ID,
+      total_seats: seats.length,
+      leaderboard: seats,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch leaderboard", detail: err.message });
+  }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
@@ -275,6 +361,7 @@ app.listen(PORT, () => {
   console.log(`Nonce:           GET  http://localhost:${PORT}/nonce`);
   console.log(`Leaderboard:     GET  http://localhost:${PORT}/leaderboard`);
   console.log(`Invoice SOL:     POST http://localhost:${PORT}/api/invoice`);
+  console.log(`Top Up:          POST http://localhost:${PORT}/api/topup`);
   console.log(`Invoice SPL:     POST http://localhost:${PORT}/api/invoice-spl`);
   console.log(`Protocol Docs:   GET  http://localhost:${PORT}/api/protocol-docs (Ed25519 gated)`);
   console.log(`Stats:           GET  http://localhost:${PORT}/api/stats (Ed25519 gated)`);
