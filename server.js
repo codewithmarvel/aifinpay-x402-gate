@@ -305,7 +305,7 @@ app.get("/leaderboard", async (req, res) => {
 
     // Seat account discriminator: sha256("account:Seat")[0..8]
     const SEAT_DISCRIMINATOR = Buffer.from([
-      0x43, 0x4d, 0x4f, 0xd4, 0x2b, 0x37, 0x7e, 0x8c,
+      0x5a, 0xe4, 0x16, 0x5a, 0xa2, 0x56, 0xad, 0x1a,
     ]);
 
     const accounts = await connection.getProgramAccounts(programId, {
